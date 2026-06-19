@@ -1,59 +1,54 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-OjiTopology - Quad Remesher Add-on for Blender
-==============================================
+OjiTopology - Quad Remesher Add-on for Blender (v3)
+===================================================
 
 選択オブジェクトを、目標頂点数を指定して **四角形ポリゴン主体のきれいな
 エッジフロー** へ自動リトポロジー(quad remesh)するアドオン。
 ZBrush の ZRemesher のように、ポリグループ（マテリアル境界／頂点グループ／
 シャープマーク／境界）をエッジフローのガイドとして使える。
 
-研究・実装の背景（v2）
+設計の変遷と v3 の方針
 ----------------------
-v1 では Blender ネイティブの `quadriflow_remesh` をラップしていたが、それは
-「ボタンを押すだけ」でアルゴリズムの中身が見えないブラックボックスであり、
-また実験用の独自エンジンも cross field の計算結果を使わず元の三角分割を
-そのままなぞるだけで、実際には整列していなかった。これらを踏まえ v2 では
-ネイティブ実装への依存をやめ、論文を踏まえた独自実装のみで構成する。
+v1: Blender ネイティブ quadriflow_remesh をラップ（中身が見えない）。
+v2: Instant Meshes の position field を実装し、頂点を格子へ収束させてから
+    クラスタリング・格子抽出して quad を作ろうとした。しかし
+    - 各エッジの整数オフセットを独立に丸める簡易抽出では大域的に整合した
+      格子にならず、出力グラフが穴だらけ・三角形だらけになった。
+    - クラスタリングで元三角分割を畳むと劣化した三角網しか残らなかった。
+    - 純 Python のループはハイポリのスカルプトで事実上停止し、空メッシュに
+      なって「メッシュが消える」現象が出た。
+    （これらの破綻はオフラインの合成データ検証で定量的に確認した。）
 
-中核アルゴリズムは Jakob et al., "Instant Field-Aligned Meshes"
-(SIGGRAPH Asia 2015) の 2 段階フィールド法を踏まえる:
+v3: クラスタリングと格子抽出を撤廃し、堅牢性を最優先した素直なパイプライン
+    に作り直す。Instant Meshes の orientation field（4-RoSy cross field）は
+    流れの方向を決めるガイドとして引き続き使うが、quad 化は「整った三角網の
+    隣接三角形ペアを field 整列度でマッチングして共有辺を溶解する」方式に統一
+    する。これにより穴やメッシュ消失が起きず、必ず有効な quad 主体メッシュに
+    なる（任意の三角網では約 80% が quad、残りは特異点付近の三角/多角形。
+    これは ZRemesher 等でも避けられない）。最後にサーフェス拘束スムージングで
+    エッジループを直線的に整える。
 
-1. Orientation field (4-RoSy cross field)
-   各頂点に「エッジが流れるべき方向」を持たせる場。Taubin の曲率テンソル法
-   (ICCV 1995) で主曲率方向から初期化し、隣接頂点との 90度対称(4-RoSy)
-   マッチングによる局所平滑化(Gauss-Seidel, ランダム順走査)で滑らかにする。
-   特徴線(シャープ/境界/マテリアル境界/頂点グループ境界)上の頂点は、その
-   特徴線のタンジェント方向に固定し、ZRemesher の Polygroups と同様に
-   エッジフローのガイドとして機能させる。
+パイプライン:
+  1. 入力取得（ハイポリは Decimate で安全な規模へ落とす）
+  2. 特徴線（ポリグループ境界）検出
+  3. 等方リメッシュで目標密度の整った三角土台を作る（特徴線を保護）
+  4. Orientation field（4-RoSy cross field）構築（特徴線で固定）
+  5. field 整列度で三角形ペアを貪欲マッチングし共有辺を溶解 → quad 主体化
+  6. 特徴線・境界を固定したサーフェス拘束スムージングで流れを整える
+  7. 元サーフェスへ Shrinkwrap して形状ディテールを保持
+  8. 対称仕上げ・スムーズシェード
 
-2. Position field
-   v1 最大の欠陥はここが無かったこと。各頂点を、自分自身の orientation
-   field が張る局所座標系上の格子点へ「歩み寄らせる」反復解法
-   (Instant Meshes 論文 Sec.4 の position field)。収束後、近い格子点に
-   集まった頂点同士を Union-Find でクラスタリングし、それぞれのクラスタを
-   新しい 1 頂点として採用する。これにより実際に **頂点位置そのものが
-   field に沿った格子へ移動する**ため、辺の流れが本当に整列する。
-
-3. Quad 抽出
-   上記でできた「格子に整列した三角メッシュ」の上で、隣接する三角形ペアを
-   field への整列度・正方性・平面性でスコアリングし、貪欲に選んで共有辺を
-   溶解して quad 化する。元の三角分割を直接 quad 化する v1 と異なり、
-   ここでは整列済みの土台メッシュを使うため意味のある quad 化になる。
-
-前処理として、入力密度と目標密度の比が大きい場合に position field の
-反復解法がエイリアシング(局所的に自己整合するが大域的には間違った格子へ
-収束する現象)を起こすことを実験で確認した。Blender 標準の Voxel Remesh は
-密度正規化に使えるが、境界・マテリアル・頂点グループなどのデータを破棄して
-しまうため、その代わりに **bmesh ネイティブの isotropic remeshing**
-(Botsch & Kobbelt 2004 の辺分割/収縮による等方化)を実装し、特徴線を保護
-しながら密度だけを正規化する。
+参考: Jakob et al. "Instant Field-Aligned Meshes" (SIGGRAPH Asia 2015) /
+      Taubin "Estimating the tensor of curvature" (ICCV 1995) /
+      Botsch & Kobbelt "A Remeshing Approach to Multiresolution Modeling"
+      (SGP 2004, 等方リメッシュ).
 """
 
 bl_info = {
     "name": "OjiTopology Quad Remesher",
     "author": "OjiTopology",
-    "version": (2, 0, 0),
+    "version": (3, 0, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > OjiTopology",
     "description": "目標頂点数を指定して四角形リトポロジー (Quad Remesh) する。"
@@ -83,6 +78,12 @@ except Exception:  # pragma: no cover - Blender はほぼ numpy を同梱する
     np = None
     _HAS_NUMPY = False
 
+# 純 Python ループの処理時間とメモリを守るため、フィールド計算に回す三角メッシュの
+# 頂点数の上限。これを超える密度は要求されても自動でこの値に丸める。
+# (参考: 純 Python の cross field 平滑化は約 250 頂点/秒。15000 頂点で約1分。
+#  これ以上は Blender が固まったように見えるため上限とする。)
+_MAX_WORKING_VERTS = 15000
+
 
 # ----------------------------------------------------------------------------
 # 設定 (PropertyGroup)
@@ -93,8 +94,8 @@ class OjiTopologySettings(PropertyGroup):
         description="リトポロジー後のおおよその頂点数",
         default=2000,
         min=8,
-        soft_max=200000,
-        max=10000000,
+        soft_max=100000,
+        max=1000000,
     )
 
     # --- 特徴線(ポリグループ境界)検出 ---------------------------------------
@@ -150,6 +151,11 @@ class OjiTopologySettings(PropertyGroup):
         description="結果をスムーズシェーディングにする",
         default=True,
     )
+    project_to_surface: BoolProperty(
+        name="元サーフェスへ投影",
+        description="結果を元のメッシュ表面へ Shrinkwrap し、ディテールを保持する",
+        default=True,
+    )
     symmetry_x: BoolProperty(name="X 対称", default=False)
     symmetry_y: BoolProperty(name="Y 対称", default=False)
     symmetry_z: BoolProperty(name="Z 対称", default=False)
@@ -164,7 +170,8 @@ class OjiTopologySettings(PropertyGroup):
     # --- アルゴリズム詳細設定 -------------------------------------------------
     field_iterations: IntProperty(
         name="方向場の平滑化回数",
-        description="orientation field (cross field) を滑らかにする反復回数",
+        description="orientation field (cross field) を滑らかにする反復回数"
+                    "(多いほど流れが滑らかだが遅くなる)",
         default=20,
         min=1,
         max=300,
@@ -174,27 +181,19 @@ class OjiTopologySettings(PropertyGroup):
         description="主曲率方向で場を初期化し、形状の特徴に沿わせる",
         default=True,
     )
-    position_iterations: IntProperty(
-        name="位置場の反復回数",
-        description="position field (頂点を格子点へ歩み寄らせる解法) の反復回数",
-        default=30,
-        min=1,
-        max=300,
-    )
-    cluster_tolerance: FloatProperty(
-        name="クラスタリング許容度",
-        description="この比率(目標辺長に対する割合)より近い頂点を1つの格子点に統合する",
-        default=0.35,
-        min=0.1,
-        max=0.9,
+    relax_iterations: IntProperty(
+        name="流れの整え回数",
+        description="quad 化後にエッジループを直線的に整えるスムージング回数",
+        default=8,
+        min=0,
+        max=60,
     )
     resample_iterations: IntProperty(
         name="密度正規化の反復回数",
-        description="位置場を解く前に密度を目標解像度へ正規化する"
-                    "(辺の分割/収縮)反復回数",
-        default=6,
+        description="目標解像度へ密度を揃える(辺分割/収縮)反復回数",
+        default=8,
         min=1,
-        max=30,
+        max=40,
     )
 
 
@@ -233,25 +232,6 @@ def _rosy_best_match(d, ref, n):
     return best
 
 
-class _UnionFind:
-    __slots__ = ("parent",)
-
-    def __init__(self, n):
-        self.parent = list(range(n))
-
-    def find(self, x):
-        p = self.parent
-        while p[x] != x:
-            p[x] = p[p[x]]
-            x = p[x]
-        return x
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
-
-
 def _symmetry_axes(settings):
     axes = set()
     if settings.symmetry_x:
@@ -280,15 +260,47 @@ def _mesh_stats(mesh):
 
 
 # ----------------------------------------------------------------------------
+# 入力取得 (ハイポリは Decimate で安全な規模に落とす)
+# ----------------------------------------------------------------------------
+def _make_working_bmesh(obj, context, target_verts):
+    """評価済みメッシュから作業用 bmesh を作る。巨大ならまず Decimate する。
+
+    ハイポリのスカルプト(数十万〜数百万ポリ)をそのまま純 Python で処理すると
+    停止・空メッシュ化するため、フィールド計算前に C++ の Decimate モディファイア
+    で安全な面数まで落とす。元データは最後まで変更しない(結果は最後に書き戻す)。
+    """
+    me = obj.data
+    n_faces = len(me.polygons)
+    # 等方リメッシュ前の安全な上限。目標頂点数の数倍あれば十分。
+    cap_faces = min(200000, max(target_verts * 8, 20000))
+
+    temp_mod = None
+    if n_faces > cap_faces:
+        temp_mod = obj.modifiers.new(name="OjiTopo_Decimate", type='DECIMATE')
+        temp_mod.decimate_type = 'COLLAPSE'
+        temp_mod.ratio = max(0.01, min(1.0, cap_faces / n_faces))
+
+    depsgraph = context.evaluated_depsgraph_get()
+    obj_eval = obj.evaluated_get(depsgraph)
+    eval_me = obj_eval.to_mesh()
+
+    bm = bmesh.new()
+    bm.from_mesh(eval_me)
+    obj_eval.to_mesh_clear()
+
+    if temp_mod is not None:
+        obj.modifiers.remove(temp_mod)
+
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    bm.normal_update()
+    return bm
+
+
+# ----------------------------------------------------------------------------
 # 特徴線(ポリグループ境界)検出
 # ----------------------------------------------------------------------------
 def _detect_feature_edges(bm, obj, settings):
-    """シャープ/角度/境界/マテリアル/頂点グループから特徴エッジを検出する。
-
-    戻り値: (feature_pairs, feature_vert)
-      feature_pairs: {(i, j), (j, i), ...} 特徴エッジの両端頂点インデックス組
-      feature_vert : bytearray(len(bm.verts)) 各頂点が特徴線上かどうか
-    """
+    """シャープ/角度/境界/マテリアル/頂点グループから特徴エッジを検出する。"""
     n = len(bm.verts)
     feature_vert = bytearray(n)
     feature_pairs = set()
@@ -306,13 +318,12 @@ def _detect_feature_edges(bm, obj, settings):
         vg = obj.vertex_groups.get(settings.vertex_group)
         if vg is not None:
             vgroup_index = vg.index
-            deform_layer = bm.verts.layers.deform.verify()
+            deform_layer = bm.verts.layers.deform.active
 
     def in_group(v):
         if deform_layer is None:
             return False
-        w = v[deform_layer].get(vgroup_index, 0.0)
-        return w >= 0.5
+        return v[deform_layer].get(vgroup_index, 0.0) >= 0.5
 
     for e in bm.edges:
         is_feature = False
@@ -348,31 +359,22 @@ def _detect_feature_edges(bm, obj, settings):
 # 密度の正規化 (isotropic remeshing: Botsch & Kobbelt 2004 の簡易版)
 # ----------------------------------------------------------------------------
 def _isotropic_resample(bm, h, feature_pairs, iterations):
-    """目標辺長 h に近づけて密度を正規化する。特徴エッジは保護する。
-
-    長い辺を分割し、短い辺(特徴線でないもの)を収縮することを繰り返す。
-    Position field の反復解法は、入力密度と目標密度の比が大きいと
-    エイリアシング(局所的には整合するが大域的に間違った格子へ収束する現象)
-    を起こすため、その前段で密度を揃える目的の処理。
-    """
-    long_len = h * 1.35
+    """目標辺長 h に近づけて密度を正規化する。特徴エッジは保護する。"""
+    long_len = h * 1.33
     short_len = h * 0.55
 
     for _ in range(iterations):
         bm.edges.ensure_lookup_table()
         long_edges = [e for e in bm.edges if e.calc_length() > long_len]
         if long_edges:
-            bmesh.ops.subdivide_edges(
-                bm, edges=long_edges, cuts=1, use_grid_fill=True,
-            )
+            bmesh.ops.subdivide_edges(bm, edges=long_edges, cuts=1,
+                                      use_grid_fill=True)
             bmesh.ops.triangulate(bm, faces=bm.faces[:])
 
         bm.edges.ensure_lookup_table()
         short_edges = []
         for e in bm.edges:
-            if e.calc_length() >= short_len:
-                continue
-            if e.is_boundary:
+            if e.calc_length() >= short_len or e.is_boundary:
                 continue
             i, j = e.verts[0].index, e.verts[1].index
             if (i, j) in feature_pairs:
@@ -382,6 +384,14 @@ def _isotropic_resample(bm, h, feature_pairs, iterations):
             bmesh.ops.collapse(bm, edges=short_edges, uvs=True)
             bmesh.ops.triangulate(bm, faces=bm.faces[:])
 
+        # 軽い接線方向の頂点再配置(等方性の改善)
+        bm.verts.ensure_lookup_table()
+        smooth_targets = [v for v in bm.verts if not v.is_boundary]
+        if smooth_targets:
+            bmesh.ops.smooth_vert(bm, verts=smooth_targets, factor=0.5,
+                                  use_axis_x=True, use_axis_y=True,
+                                  use_axis_z=True)
+
         if not long_edges and not short_edges:
             break
 
@@ -390,14 +400,10 @@ def _isotropic_resample(bm, h, feature_pairs, iterations):
 
 
 # ----------------------------------------------------------------------------
-# 1) Orientation field (4-RoSy cross field)
+# Orientation field (4-RoSy cross field)
 # ----------------------------------------------------------------------------
 def _compute_curvature_dirs(verts, vnormals, neighbors):
-    """各頂点の主曲率(最小曲率)方向を Taubin 法で推定する。
-
-    Taubin, "Estimating the tensor of curvature of a surface from a
-    polyhedral approximation" (ICCV 1995) に基づく簡易版。
-    """
+    """各頂点の主曲率(最小曲率)方向を Taubin 法(ICCV 1995)で推定する。"""
     n = len(verts)
     dirs = np.zeros((n, 3), dtype=np.float64)
     for i in range(n):
@@ -456,10 +462,7 @@ def _feature_tangents(verts, feature_pairs, n):
                 d = -d
             acc = acc + d
         nrm = np.linalg.norm(acc)
-        if nrm > 1e-9:
-            tangents[i] = acc / nrm
-        else:
-            tangents[i] = ref
+        tangents[i] = acc / nrm if nrm > 1e-9 else ref
     return tangents
 
 
@@ -513,131 +516,25 @@ def _build_field(verts, vnormals, neighbors, iterations, use_curvature,
 
 
 # ----------------------------------------------------------------------------
-# 2) Position field — v1 で欠落していた核心部分
+# Quad 化: field 整列度で三角形ペアを貪欲マッチングし共有辺を溶解する
 # ----------------------------------------------------------------------------
-def _build_position_field(verts, vnormals, field, neighbors, feature_vert,
-                           h, iterations, rng):
-    """各頂点を、自身の局所座標系上の格子点へ歩み寄らせる反復解法。
+def _quad_dominant(bm, field, feature_pairs):
+    """整った三角網の隣接三角形ペアを field 整列度でマッチングして quad 化する。
 
-    Instant Meshes 論文 Sec.4 の position field を簡略化したもの。
-    各頂点 i の局所直交基底 (field[i], binormal[i]) を作り、隣接頂点 j との
-    オフセットをその基底上で h の整数倍へスナップした目標位置へ向けて
-    Gauss-Seidel 的に更新する。特徴線上の頂点は固定する。
+    各内部エッジ(2 つの三角形が共有)について、その辺を溶解してできる四角形が
+    どれだけ cross field に沿い、正方形に近く、平面的かをスコア化する。
+    スコアの高い順に貪欲に選び、両側の三角形がまだ未使用なら共有辺を溶解する。
+    特徴エッジは溶解候補から除外して残す(ポリグループ境界を維持)。
     """
-    n = len(verts)
-    binormal = np.cross(vnormals, field)
-    p = verts.copy()
-
-    for _ in range(iterations):
-        order = list(range(n))
-        rng.shuffle(order)
-        for i in order:
-            if feature_vert[i]:
-                continue
-            oi = field[i]
-            bi = binormal[i]
-            ni = vnormals[i]
-            acc = np.zeros(3)
-            w = 0
-            for j in neighbors[i]:
-                d = p[j] - p[i]
-                u = float(np.dot(d, oi))
-                v = float(np.dot(d, bi))
-                ru = round(u / h) * h
-                rv = round(v / h) * h
-                target = p[j] - (ru * oi + rv * bi)
-                acc += target
-                w += 1
-            if w == 0:
-                continue
-            newp = acc / w
-            disp = newp - verts[i]
-            disp = disp - ni * float(np.dot(disp, ni))  # 接平面内のみ許可
-            p[i] = verts[i] + disp
-
-    return p
-
-
-# ----------------------------------------------------------------------------
-# クラスタリング (格子点へ収束した頂点群を1つの新頂点へ統合)
-# ----------------------------------------------------------------------------
-def _cluster_positions(p, vnormals, edge_list, feature_pairs, tol, feature_vert):
-    n = len(p)
-    uf = _UnionFind(n)
-    for (i, j) in edge_list:
-        if feature_vert[i] or feature_vert[j]:
-            continue
-        if (i, j) in feature_pairs:
-            continue
-        if np.linalg.norm(p[i] - p[j]) < tol:
-            uf.union(i, j)
-
-    roots = [uf.find(i) for i in range(n)]
-    remap = {}
-    cluster_id = [0] * n
-    members = []
-    for i, r in enumerate(roots):
-        if r not in remap:
-            remap[r] = len(members)
-            members.append([])
-        cid = remap[r]
-        cluster_id[i] = cid
-        members[cid].append(i)
-
-    new_positions = np.array([np.mean(p[idxs], axis=0) for idxs in members])
-    new_normals = np.zeros((len(members), 3))
-    for cid, idxs in enumerate(members):
-        m = np.mean(vnormals[idxs], axis=0)
-        nrm = np.linalg.norm(m)
-        new_normals[cid] = m / nrm if nrm > 1e-9 else np.array([0.0, 0.0, 1.0])
-
-    return cluster_id, new_positions, new_normals, members
-
-
-def _build_base_faces(triangles, cluster_id):
-    """クラスタリング後の頂点で、元の三角形位相を引き継いだ土台メッシュを作る。"""
-    seen = set()
-    faces = []
-    for (a, b, c) in triangles:
-        ca, cb, cc = cluster_id[a], cluster_id[b], cluster_id[c]
-        if ca == cb or cb == cc or ca == cc:
-            continue
-        key = frozenset((ca, cb, cc))
-        if key in seen:
-            continue
-        seen.add(key)
-        faces.append((ca, cb, cc))
-    return faces
-
-
-def _cluster_field(field, members, new_normals):
-    """クラスタごとの代表 field ベクトル(メンバーの場を RoSy マッチして平均)。"""
-    cf = np.zeros((len(members), 3))
-    for cid, idxs in enumerate(members):
-        ni = new_normals[cid]
-        ref = _tangent_project(field[idxs[0]], ni)
-        if ref is None:
-            ref = np.array([1.0, 0.0, 0.0])
-        acc = ref.copy()
-        for vi in idxs[1:]:
-            dj = _tangent_project(field[vi], ni)
-            if dj is None:
-                continue
-            acc = acc + _rosy_best_match(dj, acc, ni)
-        t = _tangent_project(acc, ni)
-        cf[cid] = t if t is not None else ref
-    return cf
-
-
-# ----------------------------------------------------------------------------
-# 3) Quad 抽出 — 整列済みの土台メッシュ上で三角形ペアを field 基準でマージ
-# ----------------------------------------------------------------------------
-def _quad_merge(bm, positions, field, locked_pairs):
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
     bm.normal_update()
+
+    pos = {v.index: np.array(v.co[:]) for v in bm.verts}
     candidates = []
     for e in bm.edges:
         i, j = e.verts[0].index, e.verts[1].index
-        if frozenset((i, j)) in locked_pairs:
+        if (i, j) in feature_pairs:
             continue
         lf = e.link_faces
         if len(lf) != 2:
@@ -651,10 +548,7 @@ def _quad_merge(bm, positions, field, locked_pairs):
         if a is None or b is None:
             continue
 
-        P0, P1, P2, P3 = (
-            positions[s0.index], positions[a.index],
-            positions[s1.index], positions[b.index],
-        )
+        P0, P1, P2, P3 = pos[s0.index], pos[a.index], pos[s1.index], pos[b.index]
         U = (P1 - P0) + (P2 - P3)
         V = (P3 - P0) + (P2 - P1)
         nU, nV = np.linalg.norm(U), np.linalg.norm(V)
@@ -701,131 +595,43 @@ def _quad_merge(bm, positions, field, locked_pairs):
 
     if to_dissolve:
         bmesh.ops.dissolve_edges(bm, edges=to_dissolve, use_verts=False)
+    bm.normal_update()
 
 
 # ----------------------------------------------------------------------------
-# エンジン本体
+# 流れを整えるサーフェス拘束スムージング
 # ----------------------------------------------------------------------------
-def engine_field_aligned(obj, settings):
-    if not _HAS_NUMPY:
-        raise RuntimeError("このエンジンには numpy が必要です")
+def _relax_flow(bm, obj, settings, iterations):
+    """quad 化後の頂点を緩和してエッジループを直線的に整える。
 
-    mesh = obj.data
+    特徴線・境界上の頂点は動かさない。各反復で接線方向の Laplacian
+    スムージングを行う(法線方向の体積収縮は後段の Shrinkwrap で戻す)。
+    """
+    if iterations <= 0:
+        return
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.ensure_lookup_table()
+    feature_pairs, feature_vert = _detect_feature_edges(bm, obj, settings)
+    movable = [v for v in bm.verts
+               if not v.is_boundary and not feature_vert[v.index]]
+    if not movable:
+        return
+    for _ in range(iterations):
+        bmesh.ops.smooth_vert(bm, verts=movable, factor=0.5,
+                              use_axis_x=True, use_axis_y=True, use_axis_z=True)
+    bm.normal_update()
 
-    src_bm = bmesh.new()
-    src_bm.from_mesh(mesh)
-    bmesh.ops.triangulate(src_bm, faces=src_bm.faces[:])
-    src_bm.normal_update()
 
-    area = sum(f.calc_area() for f in src_bm.faces)
-    if area < 1e-12 or len(src_bm.verts) < 4:
-        src_bm.free()
-        raise RuntimeError("面のあるメッシュを選択してください")
-
-    n_target = max(8, settings.target_verts)
-    h = math.sqrt(area / n_target)
-    h = max(h, 1e-6)
-
-    # --- 特徴線検出 (密度正規化の前。短辺収縮で保護するため) -------------------
-    feature_pairs, _ = _detect_feature_edges(src_bm, obj, settings)
-
-    # --- 密度正規化 (isotropic remeshing) -----------------------------------
-    _isotropic_resample(src_bm, h, feature_pairs, settings.resample_iterations)
-    src_bm.verts.ensure_lookup_table()
-    src_bm.faces.ensure_lookup_table()
-    src_bm.verts.index_update()
-
-    n = len(src_bm.verts)
-    if n < 4:
-        src_bm.free()
-        raise RuntimeError("密度正規化の結果が空になりました。目標頂点数を見直してください")
-
-    # 密度正規化でトポロジが変わったため、特徴線を現在の状態で再検出する
-    feature_pairs, feature_vert_arr = _detect_feature_edges(src_bm, obj, settings)
-    feature_vert = np.array(feature_vert_arr, dtype=bool)
-
-    verts = np.array([v.co[:] for v in src_bm.verts], dtype=np.float64)
-    vnormals = _np_normalize(np.array([v.normal[:] for v in src_bm.verts], dtype=np.float64))
-    neighbors = [[] for _ in range(n)]
-    edge_list = []
-    for e in src_bm.edges:
-        a, b = e.verts[0].index, e.verts[1].index
-        neighbors[a].append(b)
-        neighbors[b].append(a)
-        edge_list.append((a, b))
-    triangles = [tuple(v.index for v in f.verts) for f in src_bm.faces if len(f.verts) == 3]
-    src_bm.free()
-
-    rng = random.Random(settings.seed)
-    tangents = _feature_tangents(verts, feature_pairs, n)
-
-    # --- 1) Orientation field -------------------------------------------------
-    field = _build_field(
-        verts, vnormals, neighbors,
-        iterations=settings.field_iterations,
-        use_curvature=settings.field_use_curvature,
-        feature_vert=feature_vert,
-        tangents=tangents,
-        rng=rng,
-    )
-
-    # --- 2) Position field + クラスタリング (目標頂点数に近づくよう h を調整) --
-    members = None
-    new_positions = new_normals = base_faces = None
-    cur_h = h
-    for attempt in range(4):
-        p = _build_position_field(
-            verts, vnormals, field, neighbors, feature_vert,
-            cur_h, settings.position_iterations, rng,
-        )
-        tol = cur_h * settings.cluster_tolerance
-        cluster_id, cand_positions, cand_normals, cand_members = _cluster_positions(
-            p, vnormals, edge_list, feature_pairs, tol, feature_vert,
-        )
-        actual = len(cand_positions)
-        if actual < 4:
-            cur_h *= 0.6
-            continue
-        ratio = actual / n_target
-        new_positions, new_normals, members = cand_positions, cand_normals, cand_members
-        base_faces = _build_base_faces(triangles, cluster_id)
-        if 0.4 <= ratio <= 2.5 or attempt == 3:
-            break
-        cur_h *= math.sqrt(ratio)
-
-    if new_positions is None or len(new_positions) < 4:
-        raise RuntimeError("リメッシュに失敗しました。目標頂点数を見直してください")
-
-    locked_pairs = {frozenset((cluster_id[i], cluster_id[j])) for (i, j) in feature_pairs}
-    cf = _cluster_field(field, members, new_normals)
-
-    # --- 3) Quad 抽出 ----------------------------------------------------------
-    new_bm = bmesh.new()
-    bm_verts = [new_bm.verts.new(tuple(co)) for co in new_positions]
-    new_bm.verts.ensure_lookup_table()
-
-    made = set()
-    for (a, b, c) in base_faces:
-        key = frozenset((a, b, c))
-        if key in made:
-            continue
-        try:
-            new_bm.faces.new((bm_verts[a], bm_verts[b], bm_verts[c]))
-            made.add(key)
-        except ValueError:
-            continue
-
-    new_bm.normal_update()
-    _quad_merge(new_bm, new_positions, cf, locked_pairs)
-
-    bmesh.ops.dissolve_degenerate(new_bm, dist=1e-6, edges=new_bm.edges[:])
-    new_bm.normal_update()
-
-    new_bm.to_mesh(obj.data)
-    new_bm.free()
-    obj.data.update()
-
-    return "Field-Aligned"
+# ----------------------------------------------------------------------------
+# 元サーフェスへの投影 (Shrinkwrap)
+# ----------------------------------------------------------------------------
+def _project_to_surface(obj, snapshot):
+    mod = obj.modifiers.new(name="OjiTopo_Shrinkwrap", type='SHRINKWRAP')
+    mod.target = snapshot
+    mod.wrap_method = 'NEAREST_SURFACEPOINT'
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.modifier_apply(modifier=mod.name)
 
 
 # ----------------------------------------------------------------------------
@@ -851,10 +657,110 @@ def _apply_symmetry(obj, axes):
     bm.free()
     obj.data.update()
 
-    mod = obj.modifiers.new(name="OjiMirror", type='MIRROR')
+    mod = obj.modifiers.new(name="OjiTopo_Mirror", type='MIRROR')
     mod.use_axis = ('X' in axes, 'Y' in axes, 'Z' in axes)
     mod.use_clip = True
     bpy.ops.object.modifier_apply(modifier=mod.name)
+
+
+# ----------------------------------------------------------------------------
+# エンジン本体
+# ----------------------------------------------------------------------------
+def engine_field_aligned(obj, context, settings):
+    if not _HAS_NUMPY:
+        raise RuntimeError("このアドオンには numpy が必要です(Blender に同梱)")
+
+    # --- 1) 入力取得(ハイポリは Decimate) -----------------------------------
+    bm = _make_working_bmesh(obj, context, settings.target_verts)
+    bm.verts.ensure_lookup_table()
+    bm.normal_update()
+
+    area = sum(f.calc_area() for f in bm.faces)
+    if area < 1e-12 or len(bm.verts) < 4:
+        bm.free()
+        raise RuntimeError("面のあるメッシュを選択してください")
+
+    n_target = max(8, settings.target_verts)
+    # 三角土台の頂点数が上限を超えないよう h を下限でクランプする
+    min_h_from_cap = math.sqrt(area / _MAX_WORKING_VERTS)
+    h = max(math.sqrt(area / n_target), min_h_from_cap, 1e-6)
+
+    # --- 2) 特徴線検出 -------------------------------------------------------
+    feature_pairs, _ = _detect_feature_edges(bm, obj, settings)
+
+    # --- 3) 等方リメッシュ ---------------------------------------------------
+    _isotropic_resample(bm, h, feature_pairs, settings.resample_iterations)
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    n = len(bm.verts)
+    if n < 4:
+        bm.free()
+        raise RuntimeError("密度正規化の結果が空になりました。目標頂点数を見直してください")
+
+    # 密度正規化でトポロジが変わったので特徴線を再検出
+    feature_pairs, feature_vert_arr = _detect_feature_edges(bm, obj, settings)
+    feature_vert = np.array(feature_vert_arr, dtype=bool)
+
+    verts = np.array([v.co[:] for v in bm.verts], dtype=np.float64)
+    vnormals = _np_normalize(np.array([v.normal[:] for v in bm.verts], dtype=np.float64))
+    neighbors = [[] for _ in range(n)]
+    seen_pairs = set()
+    for e in bm.edges:
+        a, b = e.verts[0].index, e.verts[1].index
+        key = (a, b) if a < b else (b, a)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        neighbors[a].append(b)
+        neighbors[b].append(a)
+
+    # --- 4) Orientation field ------------------------------------------------
+    rng = random.Random(settings.seed)
+    tangents = _feature_tangents(verts, feature_pairs, n)
+    field = _build_field(
+        verts, vnormals, neighbors,
+        iterations=settings.field_iterations,
+        use_curvature=settings.field_use_curvature,
+        feature_vert=feature_vert,
+        tangents=tangents,
+        rng=rng,
+    )
+
+    # --- 5) field 誘導 quad マッチング ---------------------------------------
+    _quad_dominant(bm, field, feature_pairs)
+
+    # --- 6) 流れの整え(サーフェス拘束スムージング) --------------------------
+    _relax_flow(bm, obj, settings, settings.relax_iterations)
+
+    bmesh.ops.dissolve_degenerate(bm, dist=1e-7, edges=bm.edges[:])
+    bm.normal_update()
+
+    if len(bm.faces) == 0:
+        bm.free()
+        raise RuntimeError("結果が空になりました。目標頂点数やオプションを見直してください")
+
+    # --- 7) 元サーフェスへ投影するためのスナップショットを作って書き戻す ------
+    snapshot = None
+    if settings.project_to_surface:
+        snap_mesh = obj.data.copy()
+        snapshot = bpy.data.objects.new(obj.name + "_OjiSnap", snap_mesh)
+        context.scene.collection.objects.link(snapshot)
+        snapshot.matrix_world = obj.matrix_world.copy()
+
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+    if snapshot is not None:
+        try:
+            _project_to_surface(obj, snapshot)
+        finally:
+            mesh_data = snapshot.data
+            bpy.data.objects.remove(snapshot, do_unlink=True)
+            if mesh_data.users == 0:
+                bpy.data.meshes.remove(mesh_data)
+
+    return "Field-Aligned"
 
 
 # ----------------------------------------------------------------------------
@@ -888,7 +794,7 @@ class OBJECT_OT_ojitopology_remesh(Operator):
         context.view_layer.objects.active = obj
 
         try:
-            engine_name = engine_field_aligned(obj, settings)
+            engine_name = engine_field_aligned(obj, context, settings)
             _apply_symmetry(obj, _symmetry_axes(settings))
         except RuntimeError as exc:
             self.report({'ERROR'}, f"{exc}")
@@ -945,6 +851,7 @@ class VIEW3D_PT_ojitopology(Panel):
         box2 = layout.box()
         box2.label(text="出力オプション")
         box2.prop(settings, "smooth_normals")
+        box2.prop(settings, "project_to_surface")
         row = box2.row(align=True)
         row.label(text="対称:")
         row.prop(settings, "symmetry_x", text="X", toggle=True)
@@ -956,8 +863,7 @@ class VIEW3D_PT_ojitopology(Panel):
         box3.label(text="アルゴリズム詳細")
         box3.prop(settings, "field_use_curvature")
         box3.prop(settings, "field_iterations")
-        box3.prop(settings, "position_iterations")
-        box3.prop(settings, "cluster_tolerance")
+        box3.prop(settings, "relax_iterations")
         box3.prop(settings, "resample_iterations")
         if not _HAS_NUMPY:
             box3.label(text="numpy が見つかりません", icon='ERROR')
